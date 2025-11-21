@@ -6,13 +6,21 @@ import requests
 from dotenv import load_dotenv
 
 
-API_DEFAULT_URL = "https://edu.kafb2b.or.kr/api/v2/whsl"
+API_DEFAULT_BASE_URL = "https://edu.kafb2b.or.kr/api/v2/whsl"
 
 
-def load_config() -> tuple[str, str, str]:
-    """Load API URL and credentials from environment (.env is loaded if present)."""
+class ExpiredTokenError(RuntimeError):
+    """Raised when the API reports an expired token."""
+
+
+def load_config() -> tuple[str, str, str, str]:
+    """
+    Load configuration for the API.
+
+    Returns a tuple of (resource_base_url, token_endpoint, service_key, secret_key).
+    """
     load_dotenv()
-    api_url = os.getenv("KAFB2B_API_URL", API_DEFAULT_URL)
+    api_base = os.getenv("KAFB2B_API_URL", API_DEFAULT_BASE_URL)
     service_key = os.getenv("SRCV_KEYVAL")
     secret_key = os.getenv("SCR_KEYVAL")
 
@@ -21,7 +29,22 @@ def load_config() -> tuple[str, str, str]:
         joined = ", ".join(missing)
         raise RuntimeError(f"Missing required environment variable(s): {joined}")
 
-    return api_url, service_key, secret_key
+    resource_base, token_endpoint = _split_base_and_token_endpoint(api_base)
+    return resource_base, token_endpoint, service_key, secret_key
+
+
+def _split_base_and_token_endpoint(api_base: str) -> tuple[str, str]:
+    """Normalize configuration so we always have a base URL and token endpoint."""
+    normalized = api_base.rstrip("/")
+    last_segment = normalized.rsplit("/", 1)[-1]
+    lower_segment = last_segment.lower()
+    if lower_segment.endswith((".do", ".json", ".php", ".asp")) or "." in last_segment:
+        resource_base = normalized.rsplit("/", 1)[0]
+        token_endpoint = normalized
+    else:
+        resource_base = normalized
+        token_endpoint = f"{normalized}/access_token.do"
+    return resource_base, token_endpoint
 
 
 def _find_token(obj) -> Optional[str]:
@@ -47,11 +70,16 @@ def request_access_token(api_url: str, service_key: str, secret_key: str, timeou
 
     Expected response JSON should contain `TKN_INFO` with the token string.
     """
-    payload = {"SRCV_KEYVAL": service_key, "SCR_KEYVAL": secret_key}
     headers = {"Content-Type": "application/json"}
+    payload = {"SRCV_KEYVAL": service_key, "SCR_KEYVAL": secret_key}
 
     resp = requests.post(api_url, json=payload, headers=headers, timeout=timeout)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(
+            f"Token 요청 실패 ({resp.status_code}): {resp.text[:300]}"
+        ) from exc
 
     try:
         data = resp.json()
@@ -64,29 +92,122 @@ def request_access_token(api_url: str, service_key: str, secret_key: str, timeou
     return token
 
 
-ACCESS_TOKEN: Optional[str] = None
+def _post_market_endpoint(url: str, token: str, payload: dict, timeout: int, context: str) -> dict:
+    """POST helper that attaches the token and normalizes error handling."""
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+    try:
+        data = resp.json()
+    except ValueError:
+        data = None
+
+    if not resp.ok:
+        message = ""
+        if isinstance(data, dict):
+            message = str(data.get("MESSAGE", "")).strip()
+        if message and "만료" in message:
+            raise ExpiredTokenError(message or "만료된 토큰입니다.")
+        raise RuntimeError(
+            f"{context} 요청 실패 ({resp.status_code}): {message or resp.text[:300]}"
+        )
+
+    if data is None:
+        raise RuntimeError(f"{context} 응답이 JSON이 아닙니다: {resp.text[:300]}")
+
+    return data
+
+
+def request_sales_price(
+    INQ_REQUST_YMD: str,
+    PGE_NO: str,
+    WHMK_CD: str,
+    WHSL_CPR_CD: str,
+    timeout: int = 10,
+) -> dict:
+    """
+    판매원장 리스트를 조회한다.
+
+    함수가 호출될 때마다 토큰을 발급받아 요청에 사용한다.
+    """
+    base_url, token_endpoint, service_key, secret_key = load_config()
+    payload = {
+        "INQ_REQUST_YMD": INQ_REQUST_YMD,
+        "PGE_NO": PGE_NO,
+        "WHMK_CD": WHMK_CD,
+        "WHSL_CPR_CD": WHSL_CPR_CD,
+    }
+
+    def _request() -> dict:
+        token = request_access_token(token_endpoint, service_key, secret_key, timeout)
+        print(token)
+        return _post_market_endpoint(
+            f"{base_url}/excclcPrcInfo.do",
+            token,
+            payload,
+            timeout,
+            "판매원장",
+        )
+
+    try:
+        return _request()
+    except ExpiredTokenError:
+        return _request()
+
+
+def request_trans_info(
+    INQ_REQUST_YMD: str,
+    PGE_NO: str,
+    WHMK_CD: str,
+    WHSL_CPR_CD: str,
+    timeout: int = 10,
+) -> dict:
+    """
+    송품/거래 정보 리스트를 조회한다.
+
+    함수가 호출될 때마다 토큰을 발급받아 요청에 사용한다.
+    """
+    base_url, token_endpoint, service_key, secret_key = load_config()
+    payload = {
+        "INQ_REQUST_YMD": INQ_REQUST_YMD,
+        "PGE_NO": PGE_NO,
+        "WHMK_CD": WHMK_CD,
+        "WHSL_CPR_CD": WHSL_CPR_CD,
+    }
+
+    def _request() -> dict:
+        token = request_access_token(token_endpoint, service_key, secret_key, timeout)
+        return _post_market_endpoint(
+            f"{base_url}/trnsoInfo.do",
+            token,
+            payload,
+            timeout,
+            "거래정보",
+        )
+
+    try:
+        return _request()
+    except ExpiredTokenError:
+        return _request()
 
 
 def main() -> None:
     try:
-        api_url, service_key, secret_key = load_config()
+        date = "20251120"
+        page = "1"
+        whmk = "210001"
+        whsl = "21000102"
 
-        # If the provided URL is a base path, append the expected token endpoint.
-        if api_url.lower().endswith((".do", ".json", ".php", ".asp")) or "." in api_url.rsplit("/", 1)[-1]:
-            endpoint = api_url
-        else:
-            endpoint = api_url.rstrip("/") + "/access_token.do"
+        sales_response = request_sales_price(date, page, whmk, whsl)
+        print("Sales response:")
+        print(sales_response)
 
-        token = request_access_token(endpoint, service_key, secret_key)
-        global ACCESS_TOKEN
-        ACCESS_TOKEN = token
+        trans_response = request_trans_info(date, page, whmk, whsl)
+        print("Trans response:")
+        print(trans_response)
+
     except Exception as exc:  # keep CLI friendly
         print(f"[ERROR] {exc}", file=sys.stderr)
         sys.exit(1)
-
-    print(f"Access token: {ACCESS_TOKEN}")
-    print("hello")
-
 
 if __name__ == "__main__":
     main()
