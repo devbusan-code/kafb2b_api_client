@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 from typing import Optional
@@ -6,7 +7,7 @@ import requests
 from dotenv import load_dotenv
 
 
-API_DEFAULT_BASE_URL = "https://edu.kafb2b.or.kr/api/v2/whsl"
+DEFAULT_PGE_NO = "1"
 
 
 class ExpiredTokenError(RuntimeError):
@@ -20,17 +21,62 @@ def load_config() -> tuple[str, str, str, str]:
     Returns a tuple of (resource_base_url, token_endpoint, service_key, secret_key).
     """
     load_dotenv()
-    api_base = os.getenv("KAFB2B_API_URL", API_DEFAULT_BASE_URL)
+    api_base = os.getenv("KAFB2B_API_URL")
     service_key = os.getenv("SRCV_KEYVAL")
     secret_key = os.getenv("SCR_KEYVAL")
 
-    missing = [name for name, val in {"SRCV_KEYVAL": service_key, "SCR_KEYVAL": secret_key}.items() if not val]
+    missing = [
+        name
+        for name, val in {
+            "KAFB2B_API_URL": api_base,
+            "SRCV_KEYVAL": service_key,
+            "SCR_KEYVAL": secret_key,
+        }.items()
+        if not val
+    ]
     if missing:
         joined = ", ".join(missing)
         raise RuntimeError(f"Missing required environment variable(s): {joined}")
 
     resource_base, token_endpoint = _split_base_and_token_endpoint(api_base)
     return resource_base, token_endpoint, service_key, secret_key
+
+
+def load_market_config() -> tuple[str, str]:
+    """
+    Load market configuration for CLI execution.
+
+    Returns a tuple of (whmk_cd, whsl_cpr_cd).
+    """
+    load_dotenv()
+    whmk_cd = os.getenv("KAFB2B_WHMK_CD")
+    whsl_cpr_cd = os.getenv("KAFB2B_WHSL_CPR_CD")
+
+    missing = [
+        name
+        for name, val in {
+            "KAFB2B_WHMK_CD": whmk_cd,
+            "KAFB2B_WHSL_CPR_CD": whsl_cpr_cd,
+        }.items()
+        if not val
+    ]
+    if missing:
+        joined = ", ".join(missing)
+        raise RuntimeError(f"Missing required environment variable(s): {joined}")
+
+    return whmk_cd, whsl_cpr_cd
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="KAFB2B API client")
+    parser.add_argument("date", help="조회 요청 일자 (YYYYMMDD)")
+    parser.add_argument(
+        "-p",
+        "--page",
+        default=DEFAULT_PGE_NO,
+        help=f"페이지 번호 (기본값: {DEFAULT_PGE_NO})",
+    )
+    return parser.parse_args(argv)
 
 
 def _split_base_and_token_endpoint(api_base: str) -> tuple[str, str]:
@@ -77,18 +123,16 @@ def request_access_token(api_url: str, service_key: str, secret_key: str, timeou
     try:
         resp.raise_for_status()
     except requests.HTTPError as exc:
-        raise RuntimeError(
-            f"Token 요청 실패 ({resp.status_code}): {resp.text[:300]}"
-        ) from exc
+        raise RuntimeError(f"Token request failed ({resp.status_code})") from exc
 
     try:
         data = resp.json()
     except ValueError:
-        raise RuntimeError(f"API response is not JSON: {resp.text[:300]}")
+        raise RuntimeError("Token response is not JSON")
 
     token = _find_token(data)
     if not token:
-        raise RuntimeError(f"API response missing TKN_INFO. Body: {data!r}")
+        raise RuntimeError("Token response missing TKN_INFO")
     return token
 
 
@@ -107,12 +151,10 @@ def _post_market_endpoint(url: str, token: str, payload: dict, timeout: int, con
             message = str(data.get("MESSAGE", "")).strip()
         if message and "만료" in message:
             raise ExpiredTokenError(message or "만료된 토큰입니다.")
-        raise RuntimeError(
-            f"{context} 요청 실패 ({resp.status_code}): {message or resp.text[:300]}"
-        )
+        raise RuntimeError(f"{context} request failed ({resp.status_code})")
 
     if data is None:
-        raise RuntimeError(f"{context} 응답이 JSON이 아닙니다: {resp.text[:300]}")
+        raise RuntimeError(f"{context} response is not JSON")
 
     return data
 
@@ -139,7 +181,6 @@ def request_sales_price(
 
     def _request() -> dict:
         token = request_access_token(token_endpoint, service_key, secret_key, timeout)
-        print(token)
         return _post_market_endpoint(
             f"{base_url}/excclcPrcInfo.do",
             token,
@@ -192,16 +233,14 @@ def request_trans_info(
 
 def main() -> None:
     try:
-        date = "20251120"
-        page = "1"
-        whmk = "210001"
-        whsl = "21000102"
+        args = parse_args()
+        whmk, whsl = load_market_config()
 
-        sales_response = request_sales_price(date, page, whmk, whsl)
+        sales_response = request_sales_price(args.date, args.page, whmk, whsl)
         print("Sales response:")
         print(sales_response)
 
-        trans_response = request_trans_info(date, page, whmk, whsl)
+        trans_response = request_trans_info(args.date, args.page, whmk, whsl)
         print("Trans response:")
         print(trans_response)
 
@@ -211,3 +250,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+ 
